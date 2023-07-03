@@ -27,24 +27,43 @@ impl PlayerState {
         self.invalidate.notify_one();
     }
 
+    fn extract_value_from_variant(variant: &dyn RefArg) -> Option<&dyn RefArg> {
+        return variant.as_iter()?.next();
+    }
+
     fn update_metadata(&mut self, metadata: Box<dyn RefArg>) {
-        let mut iter = metadata.as_iter().unwrap();
+        let mut iter = match metadata.as_iter() {
+            Some(x) => x,
+            None => return
+        };
         loop {
             let key = match iter.next() {
-                Some(value) => value.as_str().unwrap(),
+                Some(value) => match value.as_str() {
+                    Some(x) => x,
+                    None => continue
+                },
                 None => break,
             };
-            let value = iter.next().unwrap() // variant
-                .as_iter().unwrap().next().unwrap(); // inner value of variant
+            let value = match iter.next().and_then(Self::extract_value_from_variant) {
+                Some(value) => value,
+                None => break // invalid
+            };
 
             match key {
                 "xesam:title" => {
-                    self.title = value.as_str().unwrap().to_string();
+                    self.title = value.as_str().unwrap_or("").to_string();
                 },
                 "xesam:artist" => {
                     self.artists.clear();
-                    for artist in value.as_iter().unwrap() {
-                        self.artists.push(artist.as_str().unwrap().to_string());
+                    let iter = match value.as_iter() {
+                        Some(iter) => iter,
+                        None => continue
+                    };
+                    for artist in iter {
+                        self.artists.push(match artist.as_str() {
+                            Some(value) => value,
+                            None => continue
+                        }.to_string());
                     }
                 },
                 _ => {
@@ -63,7 +82,9 @@ impl PlayerState {
                 },
                 "PlaybackStatus" => {
                     // Playing, Paused, Stopped
-                    self.playing = value.as_str().unwrap() == "Playing";
+                    self.playing = value.as_str()
+                        .and_then(|value| Some(value == "Playing"))
+                        .unwrap_or(false);
                 },
                 _ => {
                     //eprintln!("{} -> {:?}", field, value);
