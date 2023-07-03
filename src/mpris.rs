@@ -1,6 +1,6 @@
 use std::{sync::{Arc, Mutex, MutexGuard}, time::Duration};
 
-use dbus::{nonblock::{Proxy, SyncConnection, MethodReply}, arg::{ReadAll, AppendAll, self, RefArg}, message::MatchRule};
+use dbus::{nonblock::{Proxy, SyncConnection, MethodReply, MsgMatch}, arg::{ReadAll, AppendAll, self, RefArg}, message::MatchRule};
 use tokio::sync::Notify;
 
 pub struct PlayerState {
@@ -110,6 +110,98 @@ impl<'a> Drop for Mpris<'a> {
 }
 
 impl<'a> Mpris<'a> {
+    async fn create_property_changed_handler(conn: Arc<SyncConnection>, bus_name: String, state: Arc<Mutex<PlayerState>>) -> Result<MsgMatch, dbus::Error> {
+        let rule: MatchRule<'_> = MatchRule::new_signal("org.freedesktop.DBus.Properties", "PropertiesChanged")
+                .with_sender(bus_name.clone());
+        let r#match = conn.add_match(rule);
+        return r#match.await
+            .and_then(|x| Ok(x.cb(move |_, (interface_name, changed_properties, invalidated_properties,): (String, arg::PropMap, Vec<String>)| {
+                if interface_name != INTERFACE {
+                    return true;
+                }
+
+                if invalidated_properties.len() > 0 {
+                    eprintln!("Unhandled PropertyChanged invalidated_properties.len() > 0");
+                }
+
+                state.lock().unwrap().update(changed_properties);
+                true
+        })));
+    }
+
+    async fn create_name_owner_changed_handler(conn: Arc<SyncConnection>, bus_name: String, proxy: Proxy<'static, Arc<SyncConnection>>, state: Arc<Mutex<PlayerState>>) -> Result<MsgMatch, dbus::Error> {
+        let rule = MatchRule::new_signal("org.freedesktop.DBus", "NameOwnerChanged")
+            .with_sender("org.freedesktop.DBus");
+        let r#match = conn.add_match(rule);
+        return r#match.await
+            .and_then(|x| Ok(x.cb(move |_, (name, _old_owner, new_owner): (String, String, String)| {
+                if name != bus_name {
+                    return true;
+                }
+
+                if new_owner.is_empty() {
+                    state.lock().unwrap().name_lost();
+                } else {
+                    let proxy2 = proxy.clone();
+                    let state2 = state.clone();
+                    tokio::spawn(async move {
+                        // Spotify on startup may take some time to get the song information and
+                        // won't signal when it has them. So we wait a bit and ask for them manually.
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        let (metadata,): (arg::Variant<Box<dyn RefArg + 'static>>,) = match proxy2.method_call("org.freedesktop.DBus.Properties", "Get", (INTERFACE, "Metadata")).await {
+                            Ok(x) => x,
+                            Err(err) => {
+                                eprintln!("Failed to get metadata: {}", err);
+                                return;
+                            }
+                        };
+                        state2.lock().unwrap().update_metadata(metadata.0);
+                    });
+                }
+                true
+            })));
+    }
+
+    fn create_watcher(conn: Arc<SyncConnection>, bus_name: String, proxy: Proxy<'static, Arc<SyncConnection>>, destruct: Arc<Notify>, state: Arc<Mutex<PlayerState>>) -> tokio::task::JoinHandle<()> {
+        return tokio::spawn(async move {
+            let signal_property_changed = match Self::create_property_changed_handler(conn.clone(), bus_name.clone(), state.clone()).await {
+                Ok(handler) => handler,
+                Err(err) => {
+                    eprintln!("Failed to AddMatch on PropertiesChanged: {}", err);
+                    return;
+                }
+            };
+
+            let signal_name_owner_changed = match Self::create_name_owner_changed_handler(conn.clone(), bus_name, proxy.clone(), state.clone()).await {
+                Ok(handler) => handler,
+                Err(err) => {
+                    // There must be a more elegant solution for this, maybe something like defer?
+                    let _ = conn.remove_match(signal_property_changed.token()).await;
+                    eprintln!("Failed to AddMatch on NameOwnerChanged: {}", err);
+                    return;
+                }
+            };
+
+            let props: Option<arg::PropMap> = match proxy.method_call("org.freedesktop.DBus.Properties", "GetAll", (INTERFACE,)).await {
+                Ok((x,)) => Some(x),
+                Err(err) => {
+                    eprintln!("Failed to get properties: {}", err);
+                    None
+                }
+            };
+
+            match props {
+                Some(props) => state.lock().unwrap().update(props),
+                None => {}
+            };
+
+            destruct.notified().await;
+
+            let _ = conn.remove_match(signal_name_owner_changed.token()).await;
+            let _ = conn.remove_match(signal_property_changed.token()).await;
+        });
+    }
+
     pub fn new(conn: Arc<SyncConnection>, instance: &str, invalidate: Arc<Notify>) -> Self {
         let bus_name = format!("org.mpris.MediaPlayer2.{}", instance);
         let proxy = Proxy::new(
@@ -119,67 +211,9 @@ impl<'a> Mpris<'a> {
             conn.clone());
 
         let destruct = Arc::new(Notify::new());
-        let destruct2 = destruct.clone();
-
         let state = Arc::new(Mutex::new(PlayerState::new(invalidate)));
-        let state2 = state.clone();
 
-        let proxy2 = proxy.clone();
-
-        tokio::spawn(async move {
-            let state3 = state2.clone();
-            let rule: MatchRule<'_> = MatchRule::new_signal("org.freedesktop.DBus.Properties", "PropertiesChanged")
-                .with_sender(bus_name.clone());
-            let r#match = conn.add_match(rule);
-            let signal_property_changed = r#match.await.unwrap()
-                .cb(move |_, (interface_name, changed_properties, invalidated_properties,): (String, arg::PropMap, Vec<String>)| {
-                    if interface_name != INTERFACE {
-                        return true;
-                    }
-
-                    if invalidated_properties.len() > 0 {
-                        eprintln!("Unhandled PropertyChanged invalidated_properties.len() > 0");
-                    }
-
-                    state3.lock().unwrap().update(changed_properties);
-                    true
-                });
-
-            let proxy3 = proxy2.clone();
-            let state3 = state2.clone();
-            let rule = MatchRule::new_signal("org.freedesktop.DBus", "NameOwnerChanged")
-                .with_sender("org.freedesktop.DBus");
-            let r#match = conn.add_match(rule);
-            let signal_name_owner_changed = r#match.await.unwrap()
-                .cb(move |_, (name, _old_owner, new_owner): (String, String, String)| {
-                    if name != bus_name {
-                        return true;
-                    }
-
-                    if new_owner.is_empty() {
-                        state3.lock().unwrap().name_lost();
-                    } else {
-                        let state4 = state3.clone();
-                        let proxy4 = proxy3.clone();
-                        tokio::spawn(async move {
-                            // Spotify on startup may take some time to get the song information and
-                            // won't signal when it has them. So we wait a bit and ask for them manually.
-                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                            let (metadata,): (arg::Variant<Box<dyn RefArg + 'static>>,) = proxy4.method_call("org.freedesktop.DBus.Properties", "Get", (INTERFACE, "Metadata")).await.unwrap();
-                            state4.lock().unwrap().update_metadata(metadata.0);
-                        });
-                    }
-                    true
-                });
-
-            let (props,): (arg::PropMap,) = proxy2.method_call("org.freedesktop.DBus.Properties", "GetAll", (INTERFACE,)).await.unwrap();
-            state2.lock().unwrap().update(props);
-
-            destruct2.notified().await;
-
-            conn.remove_match(signal_name_owner_changed.token()).await.unwrap();
-            conn.remove_match(signal_property_changed.token()).await.unwrap();
-        });
+        Self::create_watcher(conn, bus_name, proxy.clone(), destruct.clone(), state.clone());
 
         return Self {
             proxy,
