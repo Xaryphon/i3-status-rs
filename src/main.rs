@@ -56,7 +56,7 @@ async fn main() {
         while let Some(line) = lines.next_line().await.unwrap() {
             let line = line.strip_prefix(',').unwrap_or(line.as_str());
             let event: ClickEvent = serde_json::from_str(line).unwrap();
-            eprintln!("{:?}", event);
+            //eprintln!("{:?}", event);
             if !event.name.is_some() {
                 continue;
             }
