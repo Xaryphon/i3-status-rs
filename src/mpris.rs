@@ -27,45 +27,37 @@ impl PlayerState {
         self.invalidate.notify_one();
     }
 
-    fn extract_value_from_variant(variant: &dyn RefArg) -> Option<&dyn RefArg> {
-        return variant.as_iter()?.next();
-    }
-
     fn update_metadata(&mut self, metadata: Box<dyn RefArg>) {
-        let mut iter = match metadata.as_iter() {
-            Some(x) => x,
-            None => return
-        };
-        loop {
-            let key = match iter.next() {
-                Some(value) => match value.as_str() {
-                    Some(x) => x,
-                    None => continue
-                },
-                None => break,
-            };
-            let value = match iter.next().and_then(Self::extract_value_from_variant) {
-                Some(value) => value,
-                None => break // invalid
-            };
+        fn extract_value_from_variant(variant: &dyn RefArg) -> Option<&dyn RefArg> {
+            return variant.as_iter()?.next();
+        }
+
+        let Some(mut iter) = metadata.as_iter()
+        else { return };
+
+        while let Some(key) = iter.next() {
+            let Some(value) = iter.next().and_then(extract_value_from_variant)
+            else { break };
+
+            let Some(key) = key.as_str()
+            else { continue };
 
             match key {
                 "xesam:title" => {
                     self.title = value.as_str().unwrap_or("").to_string();
-                },
+                }
                 "xesam:artist" => {
                     self.artists.clear();
-                    let iter = match value.as_iter() {
-                        Some(iter) => iter,
-                        None => continue
-                    };
+
+                    let Some(iter) = value.as_iter()
+                    else { continue };
+
                     for artist in iter {
-                        self.artists.push(match artist.as_str() {
-                            Some(value) => value,
-                            None => continue
-                        }.to_string());
+                        if let Some(artist) = artist.as_str() {
+                            self.artists.push(artist.to_string());
+                        }
                     }
-                },
+                }
                 _ => {
                     //eprintln!("{:?} -> {:?}", key, value);
                 }
@@ -114,8 +106,8 @@ impl<'a> Mpris<'a> {
         let rule: MatchRule<'_> = MatchRule::new_signal("org.freedesktop.DBus.Properties", "PropertiesChanged")
                 .with_sender(bus_name.clone());
         let r#match = conn.add_match(rule);
-        return r#match.await
-            .and_then(|x| Ok(x.cb(move |_, (interface_name, changed_properties, invalidated_properties,): (String, arg::PropMap, Vec<String>)| {
+        return Ok(r#match.await?
+            .cb(move |_, (interface_name, changed_properties, invalidated_properties,): (String, arg::PropMap, Vec<String>)| {
                 if interface_name != INTERFACE {
                     return true;
                 }
@@ -126,15 +118,14 @@ impl<'a> Mpris<'a> {
 
                 state.lock().unwrap().update(changed_properties);
                 true
-        })));
+            }));
     }
 
     async fn create_name_owner_changed_handler(conn: Arc<SyncConnection>, bus_name: String, proxy: Proxy<'static, Arc<SyncConnection>>, state: Arc<Mutex<PlayerState>>) -> Result<MsgMatch, dbus::Error> {
         let rule = MatchRule::new_signal("org.freedesktop.DBus", "NameOwnerChanged")
             .with_sender("org.freedesktop.DBus");
         let r#match = conn.add_match(rule);
-        return r#match.await
-            .and_then(|x| Ok(x.cb(move |_, (name, _old_owner, new_owner): (String, String, String)| {
+        return Ok(r#match.await?.cb(move |_, (name, _old_owner, new_owner): (String, String, String)| {
                 if name != bus_name {
                     return true;
                 }
@@ -159,7 +150,7 @@ impl<'a> Mpris<'a> {
                     });
                 }
                 true
-            })));
+            }));
     }
 
     fn create_watcher(conn: Arc<SyncConnection>, bus_name: String, proxy: Proxy<'static, Arc<SyncConnection>>, destruct: Arc<Notify>, state: Arc<Mutex<PlayerState>>) -> tokio::task::JoinHandle<()> {
@@ -190,10 +181,9 @@ impl<'a> Mpris<'a> {
                 }
             };
 
-            match props {
-                Some(props) => state.lock().unwrap().update(props),
-                None => {}
-            };
+            if let Some(props) = props {
+                state.lock().unwrap().update(props);
+            }
 
             destruct.notified().await;
 
